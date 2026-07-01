@@ -1,0 +1,13 @@
+{
+  "name": "expense-tracker-telegram-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Interactive Telegram bot to add expenses/income to the Expense Tracker from chat.",
+  "scripts": {
+    "set-webhook": "node set-webhook.mjs"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  }
+}
