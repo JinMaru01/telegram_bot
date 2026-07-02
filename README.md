@@ -56,6 +56,21 @@ You should see `{"ok":true,"result":true,"description":"Webhook was set"}`.
 ### 5. Test
 In Telegram, send **/menu** to your bot and tap **➕ Add Expense**.
 
+## Daily reminder (Vercel Cron)
+
+`api/daily-check.js` runs on a schedule defined in `vercel.json` (`0 14 * * *`,
+i.e. 14:00 UTC / 9 PM Cambodia). If no expense is logged that day, it sends the
+Telegram reminder. This replaces the old GitHub Actions job (now schedule-disabled).
+
+- Requires the same env vars as the bot (`FIREBASE_*`, `TELEGRAM_*`).
+- Add a `CRON_SECRET` env var in Vercel (any random string). Vercel automatically
+  sends it as `Authorization: Bearer <CRON_SECRET>`, and the function rejects
+  requests without it — so the endpoint can't be triggered publicly.
+- Test manually after deploy: `curl https://<project>.vercel.app/api/daily-check`
+  (works only while `CRON_SECRET` is unset; once set, only Vercel Cron can call it).
+
+Deploy the cron with the same `vercel --prod` used for the bot.
+
 ## Notes
 - Categories mirror `data/default-data.ts`. If you add custom categories in the
   app later, update the `CATEGORIES` array in `api/telegram.js`.
