@@ -73,6 +73,19 @@ const sendMessage = (chatId, text, replyMarkup) =>
 const answerCallback = (id, text) =>
   tg("answerCallbackQuery", { callback_query_id: id, text: text || "" });
 
+// Wallet types mirror components/wallet-form.tsx
+const WALLET_TYPES = [
+  { value: "cash", label: "💵 Cash" },
+  { value: "bank", label: "🏦 Bank Account" },
+  { value: "credit", label: "💳 Credit Card" },
+  { value: "savings", label: "🏦 Savings Account" },
+  { value: "digital", label: "📱 Digital Wallet" },
+  { value: "investment", label: "📈 Investment" },
+  { value: "other", label: "💼 Other" },
+];
+
+const CURRENCIES = ["USD", "KHR", "EUR", "GBP", "JPY", "CNY"];
+
 // ---- Keyboards ----
 function menuKeyboard() {
   return {
@@ -82,8 +95,56 @@ function menuKeyboard() {
         { text: "💵 Add Income", callback_data: "new:income" },
       ],
       [{ text: "📊 Dashboard", callback_data: "dash:menu" }],
+      [
+        { text: "👛 Wallets", callback_data: "wallet:menu" },
+        { text: "📋 Lists", callback_data: "list:show" },
+      ],
     ],
   };
+}
+
+function walletMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "➕ New Wallet", callback_data: "wallet:new" },
+        { text: "🔁 Transfer", callback_data: "wallet:transfer" },
+      ],
+      [{ text: "⬅️ Menu", callback_data: "menu:main" }],
+    ],
+  };
+}
+
+function walletTypeKeyboard() {
+  const rows = [];
+  for (let i = 0; i < WALLET_TYPES.length; i += 2) {
+    rows.push(WALLET_TYPES.slice(i, i + 2).map((t) => ({
+      text: t.label,
+      callback_data: `wtype:${t.value}`,
+    })));
+  }
+  return { inline_keyboard: rows };
+}
+
+function currencyKeyboard() {
+  const rows = [];
+  for (let i = 0; i < CURRENCIES.length; i += 3) {
+    rows.push(CURRENCIES.slice(i, i + 3).map((c) => ({
+      text: c,
+      callback_data: `wcur:${c}`,
+    })));
+  }
+  return { inline_keyboard: rows };
+}
+
+function transferWalletKeyboard(wallets, prefix, excludeId) {
+  const rows = wallets
+    .filter((w) => w.id !== excludeId)
+    .map((w) => [{
+      text: `${w.name} (${w.currency}) — ${fmt(w.balance, w.currency)}`,
+      callback_data: `${prefix}:${w.id}`,
+    }]);
+  return { inline_keyboard: rows };
 }
 
 function dashboardKeyboard() {
@@ -130,7 +191,31 @@ const clearSession = (db, chatId) => sessionRef(db, chatId).delete();
 
 async function loadWallets(db) {
   const snap = await db.collection(`users/${UID}/wallets`).get();
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  // Sort by name so the numeric ids shown in /list stay stable between calls
+  return snap.docs
+    .map((d) => ({ id: d.id, ...d.data() }))
+    .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+}
+
+function listsText(wallets) {
+  let text = "📂 *Categories*\n";
+  CATEGORIES.forEach((c, i) => {
+    text += `\`${i + 1}\` ${CATEGORY_ICONS[c] || "•"} ${c}\n`;
+  });
+  text += "\n👛 *Wallets*\n";
+  if (wallets.length) {
+    wallets.forEach((w, i) => {
+      text += `\`${i + 1}\` ${w.name} (${w.currency}) — ${fmt(w.balance, w.currency)}\n`;
+    });
+  } else {
+    text += "_No wallets yet._\n";
+  }
+  text +=
+    "\n⚡ *Quick add* — one line:\n" +
+    "`amount, category id, wallet id, description`\n" +
+    "e.g. `2$, 1, 2, lunch`\n" +
+    "Use `+` for income: `+50, 10, 1, salary`";
+  return text;
 }
 
 function fmt(amount, currency) {
@@ -166,6 +251,81 @@ async function commitRecord(db, chatId, draft) {
   batch.update(db.doc(`users/${UID}/wallets/${draft.walletId}`), { balance: newBalance });
   await batch.commit();
   return null;
+}
+
+// ---- Wallet transfer (mirrors useFirebaseData.handleWalletTransfer) ----
+async function commitTransfer(db, draft) {
+  const [fromSnap, toSnap] = await Promise.all([
+    db.doc(`users/${UID}/wallets/${draft.fromId}`).get(),
+    db.doc(`users/${UID}/wallets/${draft.toId}`).get(),
+  ]);
+  if (!fromSnap.exists || !toSnap.exists) return { error: "Wallet not found." };
+  const from = fromSnap.data();
+  const to = toSnap.data();
+
+  if (from.balance < draft.amount) {
+    return { error: `Insufficient balance in "${from.name}". Available: ${fmt(from.balance, from.currency)}` };
+  }
+
+  const rates = await getRates();
+  const convertedAmount = from.currency === to.currency
+    ? draft.amount
+    : convertWith(rates, draft.amount, from.currency, to.currency);
+
+  const batch = db.batch();
+  batch.update(db.doc(`users/${UID}/wallets/${draft.fromId}`), { balance: from.balance - draft.amount });
+  batch.update(db.doc(`users/${UID}/wallets/${draft.toId}`), { balance: to.balance + convertedAmount });
+  batch.set(db.collection(`users/${UID}/expenses`).doc(), {
+    amount: draft.amount,
+    category: "Transfer",
+    wallet: from.name,
+    toWallet: to.name,
+    convertedAmount,
+    description: draft.note || `Transfer to ${to.name}${
+      from.currency !== to.currency ? ` (${convertedAmount.toFixed(2)} ${to.currency})` : ""
+    }`,
+    date: Timestamp.now(),
+    currency: from.currency,
+    type: "transfer",
+  });
+  await batch.commit();
+  return { from, to, convertedAmount };
+}
+
+// ---- One-line quick entry: "2$, 1, 2, lunch" → amount, category id, wallet id, description ----
+async function tryQuickAdd(db, chatId, text) {
+  const parts = text.split(",").map((s) => s.trim());
+  if (parts.length < 3) return false;
+
+  const isIncome = parts[0].startsWith("+");
+  const amount = parseFloat(parts[0].replace(/[^0-9.]/g, ""));
+  const catNum = Number(parts[1]);
+  const walNum = Number(parts[2]);
+  const description = parts.slice(3).join(", ");
+
+  // Only treat it as quick entry if it structurally matches; otherwise fall through
+  if (!amount || amount <= 0 || !Number.isInteger(catNum) || !Number.isInteger(walNum)) return false;
+
+  const category = CATEGORIES[catNum - 1];
+  if (!category) {
+    await sendMessage(chatId, `⚠️ Unknown category id \`${catNum}\`. Send /list to see the ids.`);
+    return true;
+  }
+  const wallets = await loadWallets(db);
+  const wallet = wallets[walNum - 1];
+  if (!wallet) {
+    await sendMessage(chatId, `⚠️ Unknown wallet id \`${walNum}\`. Send /list to see the ids.`);
+    return true;
+  }
+
+  const type = isIncome || category === "Income/Deposit" ? "income" : "expense";
+  await finish(db, chatId, {
+    type, amount, category,
+    walletId: wallet.id,
+    currency: wallet.currency,
+    description,
+  });
+  return true;
 }
 
 // ---- Dashboard ----
@@ -292,7 +452,13 @@ export default async function handler(req, res) {
 async function handleText(db, chatId, text) {
   if (text === "/start" || text === "/menu") {
     await clearSession(db, chatId);
-    return sendMessage(chatId, "What would you like to record?", menuKeyboard());
+    return sendMessage(
+      chatId,
+      "What would you like to do?\n\n" +
+      "⚡ Or add in one line: `amount, category id, wallet id, description`\n" +
+      "e.g. `2$, 1, 2, lunch` (use `+` for income). Send /list for the ids.",
+      menuKeyboard()
+    );
   }
   if (text === "/add") {
     await setSession(db, chatId, { step: "amount", draft: { type: "expense" }, updatedAt: Date.now() });
@@ -305,6 +471,15 @@ async function handleText(db, chatId, text) {
   if (text === "/dashboard") {
     await clearSession(db, chatId);
     return sendMessage(chatId, "📊 Choose a period:", dashboardKeyboard());
+  }
+  if (text === "/wallet" || text === "/wallets") {
+    await clearSession(db, chatId);
+    return sendMessage(chatId, "👛 *Wallets*", walletMenuKeyboard());
+  }
+  if (text === "/list" || text === "/lists") {
+    await clearSession(db, chatId);
+    const wallets = await loadWallets(db);
+    return sendMessage(chatId, listsText(wallets));
   }
 
   const session = await getSession(db, chatId);
@@ -332,7 +507,62 @@ async function handleText(db, chatId, text) {
     return sendMessage(chatId, dashText, dashboardResultKeyboard(period, "USD"));
   }
 
-  return sendMessage(chatId, "Send /menu to add a record.");
+  if (session.step === "walletName") {
+    await setSession(db, chatId, { step: "walletType", newWallet: { name: text } });
+    return sendMessage(chatId, "Choose the wallet type:", walletTypeKeyboard());
+  }
+
+  if (session.step === "walletBalance") {
+    const balance = parseFloat(text.replace(/[^0-9.]/g, ""));
+    if (isNaN(balance) || balance < 0) return sendMessage(chatId, "Please enter a valid starting balance, e.g. `100` (or `0`).");
+    const w = { ...session.newWallet, balance };
+    await db.collection(`users/${UID}/wallets`).add(w);
+    await clearSession(db, chatId);
+    return sendMessage(
+      chatId,
+      `✅ *Wallet created!*\n\n${w.name} (${w.currency}) — ${fmt(balance, w.currency)}`,
+      menuKeyboard()
+    );
+  }
+
+  if (session.step === "transferAmount") {
+    const amount = parseFloat(text.replace(/[^0-9.]/g, ""));
+    if (!amount || amount <= 0) return sendMessage(chatId, "Please enter a valid amount, e.g. `12.50`");
+    await setSession(db, chatId, { step: "transferNote", transfer: { ...session.transfer, amount } });
+    return sendMessage(chatId, "Add a note, or skip:", {
+      inline_keyboard: [[{ text: "⏭ Skip", callback_data: "tfnote:skip" }]],
+    });
+  }
+
+  if (session.step === "transferNote") {
+    return finishTransfer(db, chatId, { ...session.transfer, note: text });
+  }
+
+  // One-line quick entry: "2$, 1, 2, lunch"
+  if (await tryQuickAdd(db, chatId, text)) return;
+
+  return sendMessage(
+    chatId,
+    "Send /menu for options, /list for category & wallet ids,\n" +
+    "or add in one line: `amount, category id, wallet id, description`\ne.g. `2$, 1, 2, lunch`"
+  );
+}
+
+async function finishTransfer(db, chatId, transfer) {
+  const result = await commitTransfer(db, transfer);
+  await clearSession(db, chatId);
+  if (result.error) return sendMessage(chatId, `⚠️ ${result.error}`);
+  const { from, to, convertedAmount } = result;
+  return sendMessage(
+    chatId,
+    `✅ *Transfer saved!*\n\n` +
+    `${from.name} → ${to.name}\n` +
+    `Sent: ${fmt(transfer.amount, from.currency)}\n` +
+    (from.currency !== to.currency ? `Received: ${fmt(convertedAmount, to.currency)}\n` : "") +
+    (transfer.note ? `Note: ${transfer.note}\n` : "") +
+    `\nSend /menu for more.`,
+    menuKeyboard()
+  );
 }
 
 async function handleCallback(db, chatId, cb) {
@@ -375,6 +605,75 @@ async function handleCallback(db, chatId, cb) {
     await answerCallback(cb.id);
     await finish(db, chatId, { ...session.draft, description: "" });
     return;
+  }
+
+  if (data === "menu:main") {
+    await clearSession(db, chatId);
+    await answerCallback(cb.id);
+    return sendMessage(chatId, "What would you like to do?", menuKeyboard());
+  }
+
+  if (data === "list:show") {
+    await answerCallback(cb.id);
+    const wallets = await loadWallets(db);
+    return sendMessage(chatId, listsText(wallets));
+  }
+
+  if (data === "wallet:menu") {
+    await clearSession(db, chatId);
+    await answerCallback(cb.id);
+    return sendMessage(chatId, "👛 *Wallets*", walletMenuKeyboard());
+  }
+
+  if (data === "wallet:new") {
+    await setSession(db, chatId, { step: "walletName", updatedAt: Date.now() });
+    await answerCallback(cb.id);
+    return sendMessage(chatId, "➕ *New Wallet*\n\nEnter a name for the wallet:");
+  }
+
+  if (data.startsWith("wtype:")) {
+    const type = data.slice(6);
+    await setSession(db, chatId, { newWallet: { ...session.newWallet, type } });
+    await answerCallback(cb.id);
+    return sendMessage(chatId, "Choose the currency:", currencyKeyboard());
+  }
+
+  if (data.startsWith("wcur:")) {
+    const currency = data.slice(5);
+    await setSession(db, chatId, { step: "walletBalance", newWallet: { ...session.newWallet, currency } });
+    await answerCallback(cb.id, currency);
+    return sendMessage(chatId, "Enter the starting balance:");
+  }
+
+  if (data === "wallet:transfer") {
+    const wallets = await loadWallets(db);
+    if (wallets.length < 2) {
+      await answerCallback(cb.id);
+      return sendMessage(chatId, "You need at least 2 wallets to transfer.");
+    }
+    await setSession(db, chatId, { step: "transferFrom", updatedAt: Date.now() });
+    await answerCallback(cb.id);
+    return sendMessage(chatId, "🔁 *Transfer*\n\nFrom which wallet?", transferWalletKeyboard(wallets, "tffrom"));
+  }
+
+  if (data.startsWith("tffrom:")) {
+    const fromId = data.slice(7);
+    await setSession(db, chatId, { step: "transferTo", transfer: { fromId } });
+    await answerCallback(cb.id);
+    const wallets = await loadWallets(db);
+    return sendMessage(chatId, "To which wallet?", transferWalletKeyboard(wallets, "tfto", fromId));
+  }
+
+  if (data.startsWith("tfto:")) {
+    const toId = data.slice(5);
+    await setSession(db, chatId, { step: "transferAmount", transfer: { ...session.transfer, toId } });
+    await answerCallback(cb.id);
+    return sendMessage(chatId, "Enter the amount to transfer:");
+  }
+
+  if (data === "tfnote:skip") {
+    await answerCallback(cb.id);
+    return finishTransfer(db, chatId, { ...session.transfer, note: "" });
   }
 
   if (data === "dash:menu") {

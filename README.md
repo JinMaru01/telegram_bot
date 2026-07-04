@@ -9,7 +9,8 @@ It is fully separate from the GitHub Pages site, so it does not affect that buil
 
 ## How the conversation works
 
-1. `/menu` (or `/start`) → shows **➕ Add Expense** / **💵 Add Income** buttons
+1. `/menu` (or `/start`) → shows **➕ Add Expense** / **💵 Add Income** /
+   **📊 Dashboard** / **👛 Wallets** / **📋 Lists** buttons
 2. Bot asks for the **amount** (you type a number)
 3. Bot shows **category** buttons
 4. Bot shows your **wallet** buttons (pulled live from Firestore)
@@ -17,6 +18,27 @@ It is fully separate from the GitHub Pages site, so it does not affect that buil
 6. Record is saved and the wallet balance is updated — same as adding in the app
 
 `/cancel` aborts the current entry. Only the owner chat id can use the bot.
+
+### ⚡ Quick one-line entry
+
+Skip the guided flow by sending everything in one message:
+
+```
+amount, category id, wallet id, description
+```
+
+- `2$, 1, 2, lunch` → $2 expense, category 1, wallet 2, note "lunch"
+- `+50, 10, 1, salary` → income (leading `+`, or category 10 "Income/Deposit")
+- The description is optional; send **/list** (or tap **📋 Lists**) to see the
+  numeric ids for categories and wallets. Wallet ids follow the alphabetical
+  order shown in the list.
+
+### 👛 Wallets menu (`/wallet`)
+
+- **➕ New Wallet** — name → type → currency → starting balance
+- **🔁 Transfer** — pick source & destination wallets, amount, optional note.
+  Cross-currency transfers are converted with live FX rates, and a `transfer`
+  record is saved exactly like the app's wallet transfer.
 
 ## Deploy
 
