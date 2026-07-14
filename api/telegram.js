@@ -484,6 +484,12 @@ async function handleText(db, chatId, text) {
 
   const session = await getSession(db, chatId);
 
+  // One-line quick entry ("1.25, 1, 1, Breakfast") takes priority over any
+  // pending numeric step, so a stale "enter the amount" session can't swallow it.
+  // Free-text steps are exempt — their input may legitimately contain commas.
+  const freeTextSteps = ["description", "transferNote", "walletName", "dashRange"];
+  if (!freeTextSteps.includes(session.step) && (await tryQuickAdd(db, chatId, text))) return;
+
   if (session.step === "amount") {
     const amount = parseFloat(text.replace(/[^0-9.]/g, ""));
     if (!amount || amount <= 0) return sendMessage(chatId, "Please enter a valid number, e.g. `12.50`");
@@ -537,9 +543,6 @@ async function handleText(db, chatId, text) {
   if (session.step === "transferNote") {
     return finishTransfer(db, chatId, { ...session.transfer, note: text });
   }
-
-  // One-line quick entry: "2$, 1, 2, lunch"
-  if (await tryQuickAdd(db, chatId, text)) return;
 
   return sendMessage(
     chatId,
